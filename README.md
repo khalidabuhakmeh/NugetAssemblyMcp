@@ -31,6 +31,31 @@ These are self-contained single-file executables—no .NET runtime required.
 chmod +x NuGetAssemblyMcp-osx-arm64
 ```
 
+**macOS Gatekeeper:** The pre-built binaries are ad-hoc signed (no Apple Developer ID). macOS will quarantine downloaded binaries and Gatekeeper will block them from running — especially when spawned as a subprocess by MCP clients (Claude Desktop, opencode, etc.), even if they appear to work when run directly from Terminal.
+
+You **must** remove the quarantine attribute after downloading:
+
+```bash
+# Remove quarantine from the binary and all supporting files
+xattr -cr /path/to/nuget-assembly-mcp/
+```
+
+Or for a single binary:
+```bash
+xattr -d com.apple.quarantine /path/to/NuGetAssemblyMcp-osx-arm64
+```
+
+**Symptoms if you skip this step:**
+- MCP server fails to start with no clear error message
+- The binary works fine when run directly in Terminal but fails when launched by an MCP client
+- `spctl --assess` reports the binary as "rejected"
+
+You can verify the fix worked:
+```bash
+# Should produce no output (no quarantine attributes)
+xattr /path/to/NuGetAssemblyMcp-osx-arm64
+```
+
 ### Option 2: Build from Source
 
 Prerequisites: [.NET 10.0 SDK](https://dotnet.microsoft.com/download) or later
