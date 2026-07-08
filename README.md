@@ -197,27 +197,31 @@ Searches for types by regex pattern.
 
 ## Architecture
 
-```
-┌─────────────────┐
-│   MCP Client    │  (Claude Desktop, etc.)
-└────────┬────────┘
-         │ stdio
-┌────────▼────────┐
-│  NuGetAssemblyMcp │
-├─────────────────┤
-│  PackageTools   │  list_package_versions, load_package
-│  AssemblyTools  │  list_namespaces, list_types, get_type_info, etc.
-├─────────────────┤
-│  Services       │
-│  ├─ NuGetPackageService      │  Download & cache packages
-│  ├─ AssemblyInspectionService │  Mono.Cecil reflection
-│  ├─ XmlDocService            │  XML documentation parsing
-│  └─ SourceLinkService        │  PDB/SourceLink extraction
-└─────────────────┘
-         │
-    ┌────▼────┐
-    │ NuGet.org │
-    └──────────┘
+```mermaid
+flowchart TB
+    subgraph Client
+        MCP[MCP Client<br/>Claude Desktop, etc.]
+    end
+
+    subgraph NuGetAssemblyMcp
+        subgraph Tools
+            PT[PackageTools<br/>list_package_versions, load_package]
+            AT[AssemblyTools<br/>list_namespaces, list_types, get_type_info, etc.]
+        end
+        
+        subgraph Services
+            NPS[NuGetPackageService<br/>Download & cache packages]
+            AIS[AssemblyInspectionService<br/>Mono.Cecil reflection]
+            XDS[XmlDocService<br/>XML documentation parsing]
+            SLS[SourceLinkService<br/>PDB/SourceLink extraction]
+        end
+    end
+
+    NuGet[(NuGet.org)]
+
+    MCP <-->|stdio| Tools
+    Tools --> Services
+    NPS --> NuGet
 ```
 
 ## Cache
