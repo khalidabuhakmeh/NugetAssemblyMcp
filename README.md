@@ -256,12 +256,8 @@ The `.nupkg` file is deleted after extraction to save disk space.
 dotnet test
 ```
 
-Tests use `Duende.IdentityServer` as a real-world package fixture.
+Tests use [`Duende.IdentityServer`](https://www.nuget.org/packages/Duende.IdentityServer) as a real-world package fixture.
 
 ## License
 
-[Add your license here]
-
-## Contributing
-
-[Add contribution guidelines here]
+MIT License — Copyright (c) 2025 Khalid Abuhakmeh
