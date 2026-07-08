@@ -48,6 +48,7 @@ jobs:
         run: dotnet restore ${{ env.PROJECT_PATH }}
 
       - name: Publish single-file executable
+        shell: bash
         run: |
           dotnet publish ${{ env.PROJECT_PATH }} \
             -c Release \
@@ -58,14 +59,14 @@ jobs:
             -p:IncludeNativeLibrariesForSelfExtract=true \
             -o ./publish/${{ matrix.rid }}
 
-      - name: Rename artifact (Unix)
-        if: runner.os != 'Windows'
-        run: mv ./publish/${{ matrix.rid }}/NuGetAssemblyMcp ./publish/${{ matrix.artifact }}
-
-      - name: Rename artifact (Windows)
-        if: runner.os == 'Windows'
-        run: move .\publish\${{ matrix.rid }}\NuGetAssemblyMcp.exe .\publish\${{ matrix.artifact }}
-        shell: cmd
+      - name: Rename artifact
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" == "Windows" ]; then
+            mv ./publish/${{ matrix.rid }}/NuGetAssemblyMcp.exe ./publish/${{ matrix.artifact }}
+          else
+            mv ./publish/${{ matrix.rid }}/NuGetAssemblyMcp ./publish/${{ matrix.artifact }}
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
