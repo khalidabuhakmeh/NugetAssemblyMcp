@@ -183,6 +183,10 @@ Searches for types by regex pattern.
 | `version` | string | No | Package version |
 | `targetFramework` | string | No | Target framework moniker |
 
+## Example
+
+![Example of NuGetAssemblyMcp in action](example-screenshot.png)
+
 ## Usage Examples
 
 ### Explore a Package
