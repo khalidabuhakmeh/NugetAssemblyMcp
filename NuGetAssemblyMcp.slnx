@@ -1,0 +1,8 @@
+<Solution>
+    <Folder Name="/src/">
+        <Project Path="src/NuGetAssemblyMcp/NuGetAssemblyMcp.csproj"/>
+    </Folder>
+    <Folder Name="/tests/">
+        <Project Path="tests/NuGetAssemblyMcp.Tests/NuGetAssemblyMcp.Tests.csproj"/>
+    </Folder>
+</Solution>
