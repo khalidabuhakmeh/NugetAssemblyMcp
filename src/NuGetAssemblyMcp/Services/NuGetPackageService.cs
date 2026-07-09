@@ -1,4 +1,5 @@
 using System.IO.Compression;
+using System.Text.RegularExpressions;
 using System.Xml.Linq;
 using NuGet.Common;
 using NuGet.Configuration;
@@ -11,7 +12,8 @@ namespace NuGetAssemblyMcp.Services;
 
 public class NuGetPackageService
 {
-    private static readonly string CacheRoot = Path.Combine(
+    // Fallback cache for when CLI is not available
+    private static readonly string FallbackCacheRoot = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
         ".nuget-mcp", "cache");
 
@@ -22,23 +24,132 @@ public class NuGetPackageService
         "net48", "net472", "net471", "net47", "net462", "net461", "net46", "net45"
     ];
 
+    // Regex to detect and sanitize credentials in URLs
+    // Matches patterns like: https://user:password@host or https://token@host
+    private static readonly Regex CredentialInUrlPattern = new(
+        @"(https?://)([^/@]+@)",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
     private readonly SourceCacheContext _cacheContext;
+    private readonly SourceRepository _fallbackRepository;
+    private readonly IDotNetCliRunner _cliRunner;
+    
+    // Repositories are loaded lazily per working directory to support solution-specific configs
+    private string? _currentWorkingDirectory;
+    private IReadOnlyList<SourceRepository>? _repositories;
+    private readonly object _repositoryLock = new();
 
-    private readonly SourceRepository _repository;
-
-    public NuGetPackageService()
+    public NuGetPackageService() : this(new DotNetCliRunner())
     {
-        var packageSource = new PackageSource("https://api.nuget.org/v3/index.json");
-        _repository = Repository.Factory.GetCoreV3(packageSource);
+    }
+
+    public NuGetPackageService(IDotNetCliRunner cliRunner)
+    {
+        _cliRunner = cliRunner;
         _cacheContext = new SourceCacheContext();
+        
+        // Fallback to nuget.org for API-only mode (no credentials needed)
+        var fallbackSource = new PackageSource("https://api.nuget.org/v3/index.json");
+        _fallbackRepository = Repository.Factory.GetCoreV3(fallbackSource);
+    }
+
+    /// <summary>
+    /// Indicates whether the service is using local CLI tooling (true) or API fallback (false).
+    /// </summary>
+    public bool IsUsingLocalTooling => _cliRunner.IsSdkAvailable;
+
+    /// <summary>
+    /// Sets the working directory for loading NuGet.config files.
+    /// This allows loading solution-specific package sources.
+    /// </summary>
+    /// <param name="workingDirectory">The directory to use as root for config lookup, or null to use default.</param>
+    public void SetWorkingDirectory(string? workingDirectory)
+    {
+        lock (_repositoryLock)
+        {
+            // Normalize and validate the path
+            var normalizedPath = workingDirectory is not null && Directory.Exists(workingDirectory)
+                ? Path.GetFullPath(workingDirectory)
+                : null;
+            
+            // Only reload if the directory actually changed
+            if (_currentWorkingDirectory != normalizedPath)
+            {
+                _currentWorkingDirectory = normalizedPath;
+                _repositories = null; // Force reload on next access
+            }
+        }
+    }
+
+    /// <summary>
+    /// Gets the currently configured working directory, or null if using defaults.
+    /// </summary>
+    public string? CurrentWorkingDirectory
+    {
+        get
+        {
+            lock (_repositoryLock)
+            {
+                return _currentWorkingDirectory;
+            }
+        }
+    }
+
+    private IReadOnlyList<SourceRepository> GetRepositories()
+    {
+        lock (_repositoryLock)
+        {
+            _repositories ??= LoadConfiguredRepositories(_currentWorkingDirectory);
+            return _repositories;
+        }
     }
 
     public async Task<IReadOnlyList<string>> ListVersionsAsync(string packageId, CancellationToken ct)
     {
-        var resource = await _repository.GetResourceAsync<FindPackageByIdResource>(ct);
-        var versions = await resource.GetAllVersionsAsync(packageId, _cacheContext, NullLogger.Instance, ct);
+        var allVersions = new HashSet<NuGetVersion>();
+        var tasks = new List<Task>();
+        var repositories = GetRepositories();
 
-        return versions
+        // Query all configured sources in parallel
+        foreach (var repository in repositories)
+        {
+            tasks.Add(Task.Run(async () =>
+            {
+                try
+                {
+                    var resource = await repository.GetResourceAsync<FindPackageByIdResource>(ct);
+                    var versions = await resource.GetAllVersionsAsync(packageId, _cacheContext, NullLogger.Instance, ct);
+                    
+                    lock (allVersions)
+                    {
+                        foreach (var version in versions)
+                        {
+                            allVersions.Add(version);
+                        }
+                    }
+                }
+                catch
+                {
+                    // Ignore failures from individual sources
+                    // SECURITY: Do not log or expose source URLs which may contain credentials
+                }
+            }, ct));
+        }
+
+        await Task.WhenAll(tasks);
+
+        // If no versions found from configured sources, try fallback
+        if (allVersions.Count == 0)
+        {
+            var resource = await _fallbackRepository.GetResourceAsync<FindPackageByIdResource>(ct);
+            var versions = await resource.GetAllVersionsAsync(packageId, _cacheContext, NullLogger.Instance, ct);
+            foreach (var version in versions)
+            {
+                allVersions.Add(version);
+            }
+        }
+
+        return allVersions
             .OrderByDescending(v => v)
             .Select(v => v.ToNormalizedString())
             .ToList();
@@ -50,15 +161,297 @@ public class NuGetPackageService
         string? targetFramework = null,
         CancellationToken ct = default)
     {
-        // Resolve version
-        var resolvedVersion = await ResolveVersionAsync(packageId, version, ct);
-        var packageDir = Path.Combine(CacheRoot, packageId.ToLowerInvariant(), resolvedVersion);
+        try
+        {
+            // Resolve version first (works the same regardless of CLI availability)
+            var resolvedVersion = await ResolveVersionAsync(packageId, version, ct);
+
+            // Try CLI-based restore first if available
+            if (_cliRunner.IsSdkAvailable)
+            {
+                var cliResult = await TryLoadViaCliAsync(packageId, resolvedVersion, targetFramework, ct);
+                if (cliResult is not null)
+                    return cliResult;
+            }
+
+            // Fall back to API-based download
+            return await LoadViaApiAsync(packageId, resolvedVersion, targetFramework, ct);
+        }
+        catch (Exception ex)
+        {
+            // SECURITY: Sanitize any error messages before exposing them
+            throw new InvalidOperationException(SanitizeErrorMessage(ex.Message), ex.InnerException);
+        }
+    }
+
+    /// <summary>
+    /// Gets detailed metadata for a package from configured NuGet sources.
+    /// </summary>
+    public async Task<PackageMetadata?> GetPackageMetadataAsync(
+        string packageId,
+        string? version = null,
+        CancellationToken ct = default)
+    {
+        try
+        {
+            var repositories = GetRepositories();
+            IPackageSearchMetadata? metadata = null;
+
+            // Try each repository until we find the package
+            foreach (var repository in repositories)
+            {
+                try
+                {
+                    var resource = await repository.GetResourceAsync<PackageMetadataResource>(ct);
+                    
+                    if (!string.IsNullOrEmpty(version))
+                    {
+                        // Get specific version
+                        var identity = new NuGet.Packaging.Core.PackageIdentity(packageId, NuGetVersion.Parse(version));
+                        metadata = await resource.GetMetadataAsync(identity, _cacheContext, NullLogger.Instance, ct);
+                    }
+                    else
+                    {
+                        // Get latest version
+                        var allMetadata = await resource.GetMetadataAsync(
+                            packageId, 
+                            includePrerelease: false, 
+                            includeUnlisted: false, 
+                            _cacheContext, 
+                            NullLogger.Instance, 
+                            ct);
+                        
+                        metadata = allMetadata
+                            .OrderByDescending(m => m.Identity.Version)
+                            .FirstOrDefault();
+                    }
+
+                    if (metadata is not null)
+                        break;
+                }
+                catch
+                {
+                    // SECURITY: Do not log or expose source URLs which may contain credentials
+                    continue;
+                }
+            }
+
+            // Try fallback if not found
+            if (metadata is null)
+            {
+                var resource = await _fallbackRepository.GetResourceAsync<PackageMetadataResource>(ct);
+                
+                if (!string.IsNullOrEmpty(version))
+                {
+                    var identity = new NuGet.Packaging.Core.PackageIdentity(packageId, NuGetVersion.Parse(version));
+                    metadata = await resource.GetMetadataAsync(identity, _cacheContext, NullLogger.Instance, ct);
+                }
+                else
+                {
+                    var allMetadata = await resource.GetMetadataAsync(
+                        packageId,
+                        includePrerelease: false,
+                        includeUnlisted: false,
+                        _cacheContext,
+                        NullLogger.Instance,
+                        ct);
+
+                    metadata = allMetadata
+                        .OrderByDescending(m => m.Identity.Version)
+                        .FirstOrDefault();
+                }
+            }
+
+            if (metadata is null)
+                return null;
+
+            // Get deprecation metadata asynchronously
+            PackageDeprecation? deprecation = null;
+            try
+            {
+                var deprecationData = await metadata.GetDeprecationMetadataAsync();
+                if (deprecationData is not null)
+                {
+                    deprecation = new PackageDeprecation(
+                        deprecationData.Message,
+                        deprecationData.Reasons?.ToList(),
+                        deprecationData.AlternatePackage?.PackageId,
+                        deprecationData.AlternatePackage?.Range?.ToString()
+                    );
+                }
+            }
+            catch
+            {
+                // Deprecation metadata might not be available
+            }
+
+            // Convert to our model
+            return new PackageMetadata(
+                metadata.Identity.Id,
+                metadata.Identity.Version.ToNormalizedString(),
+                metadata.Title,
+                metadata.Description,
+                metadata.Summary,
+                metadata.Authors,
+                metadata.Owners,
+                metadata.Tags,
+                metadata.ProjectUrl?.ToString(),
+                metadata.LicenseUrl?.ToString(),
+                metadata.LicenseMetadata?.License,
+                metadata.IconUrl?.ToString(),
+                metadata.ReadmeUrl?.ToString(),
+                metadata.Published,
+                metadata.DownloadCount,
+                metadata.RequireLicenseAcceptance,
+                metadata.IsListed,
+                metadata.PrefixReserved,
+                ConvertDependencies(metadata.DependencySets),
+                ConvertVulnerabilities(metadata.Vulnerabilities),
+                deprecation
+            );
+        }
+        catch (Exception ex)
+        {
+            // SECURITY: Sanitize any error messages before exposing them
+            throw new InvalidOperationException(SanitizeErrorMessage(ex.Message), ex.InnerException);
+        }
+    }
+
+    /// <summary>
+    /// Gets the list of currently configured NuGet sources based on working directory context.
+    /// SECURITY: Source URLs are sanitized to remove any embedded credentials.
+    /// </summary>
+    public IReadOnlyList<NuGetSourceInfo> GetConfiguredSources()
+    {
+        var sources = new List<NuGetSourceInfo>();
+
+        try
+        {
+            var settings = Settings.LoadDefaultSettings(root: _currentWorkingDirectory);
+            var packageSourceProvider = new PackageSourceProvider(settings);
+            var packageSources = packageSourceProvider.LoadPackageSources().ToList();
+
+            foreach (var source in packageSources)
+            {
+                // SECURITY: Sanitize the source URL to remove any embedded credentials
+                var sanitizedUrl = SanitizeSourceUrl(source.Source);
+                
+                sources.Add(new NuGetSourceInfo(
+                    source.Name,
+                    sanitizedUrl,
+                    source.IsEnabled,
+                    source.IsOfficial,
+                    source.IsMachineWide,
+                    source.ProtocolVersion > 0 ? source.ProtocolVersion.ToString() : null
+                ));
+            }
+        }
+        catch
+        {
+            // SECURITY: Do not expose error details which may contain credential information
+        }
+
+        // Always include the fallback source indicator
+        var hasFallback = !sources.Any(s => 
+            s.Url.Contains("api.nuget.org", StringComparison.OrdinalIgnoreCase));
+        
+        if (hasFallback || sources.Count == 0)
+        {
+            sources.Add(new NuGetSourceInfo(
+                "nuget.org (fallback)",
+                "https://api.nuget.org/v3/index.json",
+                IsEnabled: true,
+                IsOfficial: true,
+                IsMachineWide: false,
+                ProtocolVersion: "3"
+            ));
+        }
+
+        return sources;
+    }
+
+    private static IReadOnlyList<Models.PackageDependencyGroup> ConvertDependencies(
+        IEnumerable<NuGet.Packaging.PackageDependencyGroup>? dependencySets)
+    {
+        if (dependencySets is null)
+            return [];
+
+        return dependencySets.Select(group => new Models.PackageDependencyGroup(
+            group.TargetFramework?.GetShortFolderName() ?? "any",
+            group.Packages.Select(p => new Models.PackageDependency(
+                p.Id,
+                p.VersionRange?.ToString() ?? "*"
+            )).ToList()
+        )).ToList();
+    }
+
+    private static IReadOnlyList<Models.PackageVulnerability>? ConvertVulnerabilities(
+        IEnumerable<PackageVulnerabilityMetadata>? vulnerabilities)
+    {
+        if (vulnerabilities is null || !vulnerabilities.Any())
+            return null;
+
+        return vulnerabilities.Select(v => new Models.PackageVulnerability(
+            v.AdvisoryUrl?.ToString() ?? "",
+            v.Severity.ToString()
+        )).ToList();
+    }
+
+    /// <summary>
+    /// Sanitizes a source URL to remove any embedded credentials.
+    /// </summary>
+    private static string SanitizeSourceUrl(string url)
+    {
+        if (string.IsNullOrEmpty(url))
+            return url;
+
+        return CredentialInUrlPattern.Replace(url, "$1***@");
+    }
+
+    private async Task<PackageContent?> TryLoadViaCliAsync(
+        string packageId,
+        string version,
+        string? targetFramework,
+        CancellationToken ct)
+    {
+        // Check if already in global cache
+        var packageDir = GetGlobalCachePackagePath(packageId, version);
+        
+        if (!Directory.Exists(packageDir))
+        {
+            // Try to restore via CLI
+            var restored = await _cliRunner.RestorePackageAsync(packageId, version, ct);
+            if (!restored || !Directory.Exists(packageDir))
+                return null;
+        }
+
+        return BuildPackageContent(packageId, version, packageDir, targetFramework);
+    }
+
+    private async Task<PackageContent> LoadViaApiAsync(
+        string packageId,
+        string version,
+        string? targetFramework,
+        CancellationToken ct)
+    {
+        var packageDir = Path.Combine(FallbackCacheRoot, packageId.ToLowerInvariant(), version);
 
         // Check if already cached
         if (!Directory.Exists(packageDir) ||
             !Directory.GetFiles(packageDir, "*.dll", SearchOption.AllDirectories).Any())
-            await DownloadAndExtractAsync(packageId, resolvedVersion, packageDir, ct);
+        {
+            await DownloadAndExtractAsync(packageId, version, packageDir, ct);
+        }
 
+        return BuildPackageContent(packageId, version, packageDir, targetFramework);
+    }
+
+    private PackageContent BuildPackageContent(
+        string packageId,
+        string version,
+        string packageDir,
+        string? targetFramework)
+    {
         // Parse nuspec for repository metadata
         var (repositoryUrl, repositoryCommit) = ParseNuspec(packageDir, packageId);
 
@@ -83,7 +476,7 @@ public class NuGetPackageService
 
         return new PackageContent(
             packageId,
-            resolvedVersion,
+            version,
             dllPath,
             xmlDocPath,
             pdbPath,
@@ -93,19 +486,40 @@ public class NuGetPackageService
         );
     }
 
+    private string GetGlobalCachePackagePath(string packageId, string version)
+    {
+        // Global cache structure: ~/.nuget/packages/{id.lowercase}/{version}/
+        return Path.Combine(
+            _cliRunner.GlobalPackagesPath,
+            packageId.ToLowerInvariant(),
+            version.ToLowerInvariant());
+    }
+
     private async Task<string> ResolveVersionAsync(string packageId, string? version, CancellationToken ct)
     {
-        if (!string.IsNullOrEmpty(version)) return NuGetVersion.Parse(version).ToNormalizedString();
+        if (!string.IsNullOrEmpty(version)) 
+            return NuGetVersion.Parse(version).ToNormalizedString();
 
-        var resource = await _repository.GetResourceAsync<FindPackageByIdResource>(ct);
-        var versions = await resource.GetAllVersionsAsync(packageId, _cacheContext, NullLogger.Instance, ct);
+        // Get all versions from configured sources
+        var versions = await ListVersionsAsync(packageId, ct);
+        
+        if (versions.Count == 0)
+            throw new InvalidOperationException($"No versions found for package '{packageId}'");
 
+        // Find latest stable, or latest prerelease if no stable exists
         var latest = versions
-                         .Where(v => !v.IsPrerelease)
-                         .OrderByDescending(v => v)
-                         .FirstOrDefault()
-                     ?? versions.OrderByDescending(v => v).FirstOrDefault()
-                     ?? throw new InvalidOperationException($"No versions found for package '{packageId}'");
+            .Select(NuGetVersion.Parse)
+            .Where(v => !v.IsPrerelease)
+            .OrderByDescending(v => v)
+            .FirstOrDefault();
+
+        if (latest is null)
+        {
+            latest = versions
+                .Select(NuGetVersion.Parse)
+                .OrderByDescending(v => v)
+                .First();
+        }
 
         return latest.ToNormalizedString();
     }
@@ -118,7 +532,7 @@ public class NuGetPackageService
     {
         Directory.CreateDirectory(packageDir);
 
-        var resource = await _repository.GetResourceAsync<FindPackageByIdResource>(ct);
+        var resource = await _fallbackRepository.GetResourceAsync<FindPackageByIdResource>(ct);
         var nupkgPath = Path.Combine(packageDir, $"{packageId}.{version}.nupkg");
 
         await using (var fileStream = File.Create(nupkgPath))
@@ -141,6 +555,57 @@ public class NuGetPackageService
 
         // Remove the nupkg to save space
         File.Delete(nupkgPath);
+    }
+
+    private static IReadOnlyList<SourceRepository> LoadConfiguredRepositories(string? rootDirectory)
+    {
+        try
+        {
+            // Load settings from NuGet.config hierarchy starting from the specified root
+            // This allows loading solution-specific configs when rootDirectory is set
+            var settings = Settings.LoadDefaultSettings(root: rootDirectory);
+            var packageSourceProvider = new PackageSourceProvider(settings);
+            var sources = packageSourceProvider.LoadPackageSources()
+                .Where(s => s.IsEnabled)
+                .ToList();
+
+            if (sources.Count == 0)
+            {
+                // No configured sources, use nuget.org as default
+                sources.Add(new PackageSource("https://api.nuget.org/v3/index.json"));
+            }
+
+            return sources
+                .Select(s => Repository.Factory.GetCoreV3(s))
+                .ToList();
+        }
+        catch
+        {
+            // Fall back to nuget.org only
+            // SECURITY: Do not log exception which may contain credential information
+            var defaultSource = new PackageSource("https://api.nuget.org/v3/index.json");
+            return [Repository.Factory.GetCoreV3(defaultSource)];
+        }
+    }
+
+    /// <summary>
+    /// Sanitizes error messages to remove any potential credential information.
+    /// </summary>
+    private static string SanitizeErrorMessage(string message)
+    {
+        if (string.IsNullOrEmpty(message))
+            return message;
+
+        // Remove credentials from URLs (user:password@host or token@host patterns)
+        var sanitized = CredentialInUrlPattern.Replace(message, "$1***@");
+        
+        // Also redact common credential-related terms that might appear in error messages
+        sanitized = Regex.Replace(sanitized, 
+            @"(api[_-]?key|password|secret|token|credential)['""]?\s*[:=]\s*['""]?[^'""&\s]+", 
+            "$1=***", 
+            RegexOptions.IgnoreCase);
+        
+        return sanitized;
     }
 
     private static (string? RepositoryUrl, string? RepositoryCommit) ParseNuspec(
@@ -185,7 +650,8 @@ public class NuGetPackageService
             .Cast<string>()
             .ToList();
 
-        if (availableTfms.Count == 0) throw new InvalidOperationException("No target framework folders found in lib/");
+        if (availableTfms.Count == 0) 
+            throw new InvalidOperationException("No target framework folders found in lib/");
 
         // If a specific TFM was requested, try to match it
         if (!string.IsNullOrEmpty(targetFramework))

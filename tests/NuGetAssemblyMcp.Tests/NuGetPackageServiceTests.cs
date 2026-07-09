@@ -3,9 +3,27 @@ using Xunit.Abstractions;
 
 namespace NuGetAssemblyMcp.Tests;
 
+/// <summary>
+/// Integration tests for NuGetPackageService.
+/// These tests verify end-to-end functionality with real NuGet operations.
+/// </summary>
 public class NuGetPackageServiceTests(ITestOutputHelper output)
 {
     private readonly NuGetPackageService _service = new();
+
+    [Fact]
+    public void Constructor_DetectsLocalToolingAvailability()
+    {
+        // This test verifies that the service correctly detects SDK availability
+        output.WriteLine($"IsUsingLocalTooling: {_service.IsUsingLocalTooling}");
+        
+        // On a dev machine with SDK installed, this should be true
+        // The test just verifies the property is accessible and consistent
+        var firstCheck = _service.IsUsingLocalTooling;
+        var secondCheck = _service.IsUsingLocalTooling;
+        
+        Assert.Equal(firstCheck, secondCheck); // Should be cached/consistent
+    }
 
     [Fact]
     public async Task ListVersions_ReturnsVersionsForDuendeIdentityServer()
