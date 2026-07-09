@@ -340,4 +340,4 @@ Tests use [`Duende.IdentityServer`](https://www.nuget.org/packages/Duende.Identi
 
 ## License
 
-MIT License — Copyright (c) 2025 Khalid Abuhakmeh
+MIT License — Copyright (c) 2026 Khalid Abuhakmeh
