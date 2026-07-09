@@ -39,6 +39,7 @@ jobs:
           dotnet-version: '10.0.x'
 
       - name: Publish
+        shell: bash
         run: |
           dotnet publish src/NuGetAssemblyMcp/NuGetAssemblyMcp.csproj \
             -c Release \
