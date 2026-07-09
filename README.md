@@ -5,6 +5,8 @@ An MCP (Model Context Protocol) server that enables AI assistants to inspect and
 ## Features
 
 - **Package Management** — Download and cache NuGet packages with automatic version resolution
+- **Private Feed Support** — Load solution-specific NuGet.config files to access private/authenticated feeds
+- **Package Metadata** — View descriptions, licenses, dependencies, vulnerabilities, and deprecation status
 - **Assembly Inspection** — Explore namespaces, types, and members using Mono.Cecil (safe IL-level reflection)
 - **XML Documentation** — Extract summaries, parameter docs, and examples from XML doc files
 - **SourceLink Integration** — Resolve repository URLs for browsing source code on GitHub, GitLab, or Azure DevOps
@@ -111,6 +113,15 @@ Add the server to your MCP client configuration. For example, in Claude Desktop'
 
 ### Package Tools
 
+#### `set_working_directory`
+Sets the working directory for NuGet.config lookup. Use this to load solution-specific package sources (e.g., private feeds).
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `directoryPath` | string | No | Directory path for NuGet.config lookup (typically solution root). Pass empty/null to reset to default. |
+
+**Returns:** Confirmation with the current working directory path.
+
 #### `list_package_versions`
 Lists all available versions of a NuGet package (newest first).
 
@@ -128,6 +139,25 @@ Downloads and caches a NuGet package, returning metadata about the package conte
 | `targetFramework` | string | No | Target framework (e.g., "net8.0"); auto-selected if omitted |
 
 **Returns:** Package metadata including repository URL, commit hash, and file availability.
+
+#### `get_package_metadata`
+Gets detailed package metadata from NuGet sources—similar to what you'd see on NuGet.org.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `packageId` | string | Yes | The NuGet package ID |
+| `version` | string | No | Specific version; defaults to latest stable |
+
+**Returns:** Description, authors, license, project URL, dependencies, vulnerabilities, and deprecation status.
+
+#### `list_sources`
+Lists the currently configured NuGet package sources based on the working directory context.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| _(none)_ | — | — | Uses the current working directory set by `set_working_directory` |
+
+**Returns:** List of package sources with name, URL, enabled status, and whether they're machine-wide or official.
 
 ### Assembly Tools
 
@@ -216,6 +246,27 @@ Searches for types by regex pattern.
 → search_types(packageId: "Newtonsoft.Json", pattern: ".*Converter$")
 ```
 
+### Package Metadata
+
+```
+"Is this package deprecated or vulnerable?"
+→ get_package_metadata(packageId: "Newtonsoft.Json")
+
+"What license does Serilog use?"
+→ get_package_metadata(packageId: "Serilog")
+```
+
+### Private Feeds
+
+```
+"Use my solution's NuGet sources"
+→ set_working_directory(directoryPath: "/path/to/MySolution")
+→ list_sources()
+
+"Load a package from our private feed"
+→ load_package(packageId: "MyCompany.Internal.Package")
+```
+
 ### Version-Specific Queries
 
 ```
@@ -234,7 +285,7 @@ flowchart TB
 
     subgraph NuGetAssemblyMcp
         subgraph Tools
-            PT[PackageTools<br/>list_package_versions, load_package]
+            PT[PackageTools<br/>set_working_directory, list_package_versions,<br/>load_package, get_package_metadata, list_sources]
             AT[AssemblyTools<br/>list_namespaces, list_types, get_type_info, etc.]
         end
         
@@ -246,7 +297,7 @@ flowchart TB
         end
     end
 
-    NuGet[(NuGet.org)]
+    NuGet[(NuGet.org<br/>+ Private Feeds)]
 
     MCP <-->|stdio| Tools
     Tools --> Services
